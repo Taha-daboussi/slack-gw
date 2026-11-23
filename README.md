@@ -34,6 +34,7 @@ Put the URL first: `websocat` 1.x reads a URL after `-H` as a second header.
 ## Install
 
 ```sh
+git clone https://github.com/Taha-daboussi/slack-gw.git ~/slack-gw && cd ~/slack-gw
 ./install.sh                      # links bin/slack-gw into ~/.local/bin, installs the unit, creates the config
 $EDITOR ~/.config/slack-gw/config.json
 slack-gw login                    # Chrome/Brave may ask "Allow remote debugging?": click Allow
@@ -83,8 +84,20 @@ This is how I let an agent handle a team channel for me:
 
 `send_channels` is the hard stop: the tool refuses a post to any other channel.
 
+## Warning
+
+This tool drives your own Slack account with the session of your browser, not with an official Slack app. Slack's terms do not allow automated use of a user account, and a workspace admin can see the session. Use it only where you accept that risk, and keep `auth.json` private: it is a full login to your account.
+
 ## Limits
 
 - `login` needs the browser once, and again when the session expires (Slack login has password, SSO and 2FA steps).
 - The session is your own account. Anything the tool sends is from you.
 - `rtm.connect` with a browser session works today; Slack can change that.
+
+## See also
+
+[discord-gw](https://github.com/Taha-daboussi/discord-gw): the read-only Discord listener with the same `read` / `wait` / `thread` commands.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
