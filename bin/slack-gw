@@ -287,10 +287,11 @@ class Recorder:
         self.meta(last_event_at=now_iso())
 
     def author(self, m):
-        uid = m.get("user") or m.get("bot_id")
-        bp = m.get("bot_profile") or {}
-        if uid and (bp.get("name") or m.get("username")):
-            self.user(uid, bp.get("name") or m.get("username"))
+        bot = m.get("bot_id")
+        uid = bot if bot and m.get("subtype") == "bot_message" else m.get("user") or bot
+        name = (m.get("bot_profile") or {}).get("name") or m.get("username")
+        if uid and uid.startswith("B") and name:
+            self.user(uid, name)
         return uid
 
     def message(self, cid, m, source="live"):
