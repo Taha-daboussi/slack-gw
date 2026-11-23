@@ -1,0 +1,6 @@
+{
+  "team_id": "T00000000",
+  "default_channel": "C00000000",
+  "send_channels": ["C00000000"],
+  "channels": []
+}

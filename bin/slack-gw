@@ -1,0 +1,1125 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["websockets>=14,<17"]
+# ///
+import argparse
+import asyncio
+import fcntl
+import html
+import json
+import mimetypes
+import os
+import random
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+CONF_DIR = Path(os.environ.get("SLACK_GW_CONF", HOME / ".config/slack-gw"))
+STATE_DIR = Path(os.environ.get("SLACK_GW_STATE", HOME / ".local/state/slack-gw"))
+AUTH = CONF_DIR / "auth.json"
+CONFIG = CONF_DIR / "config.json"
+DB = STATE_DIR / "slack.db"
+LOCK = STATE_DIR / "daemon.lock"
+MEDIA = STATE_DIR / "media"
+SERVICE = "slack-gw.service"
+DEFAULT_CONFIG = {
+    "team_id": None,
+    "default_channel": None,
+    "send_channels": [],
+    "channels": [],
+}
+AUTH_ERRORS = {"invalid_auth", "not_authed", "token_revoked", "account_inactive", "token_expired"}
+CONV_TYPES = "public_channel,private_channel,mpim,im"
+EXIT_AUTH = 3
+EXIT_DOWN = 4
+EXIT_TIMEOUT = 5
+ALIVE_SECS = 150
+PING_SECS = 30
+BACKFILL_DAYS = 7
+MEDIA_PARALLEL = 3
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+
+USAGE = """\
+Slack listener and sender for the agents (one workspace, team_id in the config).
+One shared daemon (systemd user service slack-gw) records the conversations you are a member of
+in a local SQLite store, live over the Slack websocket. send and reply post as you, only to the
+channels in send_channels of the config (default: none).
+
+  slack-gw status                                   listener state and the recorded conversations
+  slack-gw read   [--channel C] [--last N | --since TS | --around TS] [--json]
+  slack-gw wait   [--channel C|all] [--cursor N | --since TS] [--timeout 60m] [--batch 30s] [--others] [--json]
+  slack-gw thread TS [--channel C]                  a message and every reply in its thread
+  slack-gw send   TEXT|- [--channel C] [--thread TS] [--broadcast] [--file PATH ...]
+  slack-gw reply  TS TEXT|- [--channel C] [--broadcast] [--file PATH ...]
+  slack-gw media  TS [--channel C]                  the local files of one message
+  slack-gw login                                    take a fresh session from the logged-in browser
+  slack-gw daemon                                   the listener itself (systemd runs it)
+
+C is a channel id or a part of its name; the default is default_channel of the config.
+TS is a Slack message ts (for example 1795281453.235269).
+wait exits 0 with new events, 5 at the timeout, 4 when the listener is down, 3 when the session is refused.
+"""
+
+
+class AuthError(Exception):
+    pass
+
+
+class SlackError(Exception):
+    pass
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def ts_iso(ts):
+    return datetime.fromtimestamp(float(ts), timezone.utc).isoformat(timespec="seconds") if ts else None
+
+
+def log(msg):
+    print(f"{datetime.now().strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def parse_duration(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad duration {text!r}; use 30s, 10m or 2h")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def parse_ts(text):
+    if not re.fullmatch(r"\d{9,11}\.\d{6}", text):
+        raise argparse.ArgumentTypeError(f"bad ts {text!r}; use a Slack ts like 1795281453.235269")
+    return text
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG.exists():
+        cfg.update(json.loads(CONFIG.read_text()))
+    return cfg
+
+
+def load_auth():
+    if not AUTH.exists():
+        raise AuthError("no session yet. Run: slack-gw login")
+    return json.loads(AUTH.read_text())
+
+
+def write_private(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(path, 0o600)
+
+
+class Slack:
+    def __init__(self, auth):
+        self.token = auth["token"]
+        self.cookie = auth["d"]
+        self.base = f"https://{auth['domain']}.slack.com/api/"
+
+    def headers(self, extra=None):
+        h = {"Cookie": f"d={self.cookie}", "User-Agent": UA}
+        h.update(extra or {})
+        return h
+
+    def call(self, method, **params):
+        params = {k: (json.dumps(v) if isinstance(v, (list, dict)) else str(v)) for k, v in params.items() if v is not None}
+        params["token"] = self.token
+        body = urllib.parse.urlencode(params).encode()
+        for _ in range(6):
+            req = urllib.request.Request(self.base + method, data=body, headers=self.headers())
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    out = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(float(e.headers.get("Retry-After", 5)) + 0.5)
+                    continue
+                raise SlackError(f"{method}: HTTP {e.code}") from None
+            if out.get("ok"):
+                return out
+            err = out.get("error", "unknown_error")
+            if err in AUTH_ERRORS:
+                raise AuthError(f"{method}: {err}")
+            if err == "ratelimited":
+                time.sleep(5)
+                continue
+            raise SlackError(f"{method}: {err}")
+        raise SlackError(f"{method}: still rate limited")
+
+    def pages(self, method, key, **params):
+        cursor = None
+        while True:
+            out = self.call(method, cursor=cursor, **params)
+            yield from out.get(key, [])
+            cursor = (out.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                return
+
+    def download(self, url, dest):
+        u = urllib.parse.urlsplit(url)
+        if u.scheme != "https" or not (u.hostname or "").endswith(".slack.com"):
+            raise ValueError(f"not a Slack file link (host {u.hostname})")
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = dest.with_name(f".{dest.name}.{os.getpid()}.part")
+        try:
+            req = urllib.request.Request(url, headers=self.headers({"Authorization": f"Bearer {self.token}"}))
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if "text/html" in (r.headers.get("Content-Type") or ""):
+                    raise OSError("Slack returned a login page, not the file")
+                with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                    shutil.copyfileobj(r, f)
+            os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return dest.stat().st_size
+
+    def upload(self, path):
+        data = Path(path).read_bytes()
+        name = Path(path).name
+        got = self.call("files.getUploadURLExternal", filename=name, length=len(data))
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        req = urllib.request.Request(got["upload_url"], data=data, headers={"Content-Type": ctype, "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            r.read()
+        return {"id": got["file_id"], "title": name}
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT);
+CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, name TEXT, kind TEXT);
+CREATE TABLE IF NOT EXISTS messages (
+  channel_id TEXT NOT NULL, ts TEXT NOT NULL, user_id TEXT, subtype TEXT, text TEXT,
+  thread_ts TEXT, reply_count INTEGER, latest_reply TEXT, edited_at TEXT, files TEXT,
+  deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (channel_id, ts));
+CREATE INDEX IF NOT EXISTS messages_thread ON messages(channel_id, thread_ts);
+CREATE TABLE IF NOT EXISTS reactions (
+  channel_id TEXT NOT NULL, ts TEXT NOT NULL, emoji TEXT NOT NULL, user_id TEXT NOT NULL, at TEXT,
+  PRIMARY KEY (channel_id, ts, emoji, user_id));
+CREATE TABLE IF NOT EXISTS events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, channel_id TEXT NOT NULL, ts TEXT NOT NULL,
+  kind TEXT NOT NULL, user_id TEXT, emoji TEXT, source TEXT);
+CREATE INDEX IF NOT EXISTS events_channel ON events(channel_id, seq);
+CREATE INDEX IF NOT EXISTS events_message ON events(channel_id, ts);
+"""
+
+
+def db_connect():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    fresh = not DB.exists()
+    con = sqlite3.connect(DB, timeout=15, isolation_level=None)
+    if fresh:
+        os.chmod(DB, 0o600)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=15000")
+    con.executescript(SCHEMA)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def safe_name(name):
+    name = re.sub(r"[\x00-\x1f\x7f/\\]", "_", name or "").strip().lstrip(".")
+    stem, ext = os.path.splitext(name)
+    return stem[:150] + ext[:20] or "file"
+
+
+def files_of(m):
+    out = []
+    for f in m.get("files") or []:
+        if f.get("mode") == "tombstone" or not f.get("id"):
+            continue
+        out.append({"id": f["id"], "name": f.get("name") or f.get("title"), "mimetype": f.get("mimetype"),
+                    "url": f.get("url_private_download") or f.get("url_private")})
+    for a in m.get("attachments") or []:
+        if a.get("title") or a.get("from_url") or a.get("text"):
+            out.append({"link": a.get("from_url") or a.get("title_link"), "title": a.get("title"), "text": (a.get("text") or "")[:300]})
+    return json.dumps(out) if out else None
+
+
+def file_path(cid, ts, f):
+    return MEDIA / cid / ts / safe_name(f"{f['id']}-{f.get('name') or 'file'}")
+
+
+class Recorder:
+    def __init__(self, con, watch):
+        self.con = con
+        self.watch = set(watch)
+        self.names = {r["id"]: r["name"] for r in con.execute("SELECT id, name FROM users")}
+
+    def watched(self, cid):
+        return cid in self.watch
+
+    def meta(self, **kv):
+        for k, v in kv.items():
+            self.con.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, None if v is None else str(v)))
+
+    def user(self, uid, name):
+        if not uid or not name or self.names.get(uid) == name:
+            return
+        self.names[uid] = name
+        self.con.execute("INSERT OR REPLACE INTO users (id, name) VALUES (?, ?)", (uid, name))
+
+    def channel(self, cid, name, kind):
+        self.con.execute("INSERT OR REPLACE INTO channels (id, name, kind) VALUES (?, ?, ?)", (cid, name, kind))
+
+    def event(self, cid, ts, kind, at, user_id=None, emoji=None, source="live"):
+        self.con.execute(
+            "INSERT INTO events (at, channel_id, ts, kind, user_id, emoji, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (at or now_iso(), cid, ts, kind, user_id, emoji, source),
+        )
+        self.meta(last_event_at=now_iso())
+
+    def author(self, m):
+        uid = m.get("user") or m.get("bot_id")
+        bp = m.get("bot_profile") or {}
+        if uid and (bp.get("name") or m.get("username")):
+            self.user(uid, bp.get("name") or m.get("username"))
+        return uid
+
+    def message(self, cid, m, source="live"):
+        if not self.watched(cid) or not m.get("ts"):
+            return False
+        ts = m["ts"]
+        uid = self.author(m)
+        thread_ts = m.get("thread_ts") if m.get("thread_ts") != ts else None
+        edited = ts_iso((m.get("edited") or {}).get("ts"))
+        values = (uid, m.get("subtype"), m.get("text", ""), thread_ts, m.get("reply_count"), m.get("latest_reply"), edited, files_of(m))
+        row = self.con.execute("SELECT text, edited_at, deleted FROM messages WHERE channel_id=? AND ts=?", (cid, ts)).fetchone()
+        if row is None:
+            self.con.execute(
+                "INSERT INTO messages (user_id, subtype, text, thread_ts, reply_count, latest_reply, edited_at, files, channel_id, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (*values, cid, ts))
+            self.event(cid, ts, "message", ts_iso(ts), uid, source=source)
+            return True
+        self.con.execute(
+            "UPDATE messages SET user_id=?, subtype=?, text=?, thread_ts=?, reply_count=?, latest_reply=?, edited_at=?, files=? "
+            "WHERE channel_id=? AND ts=?", (*values, cid, ts))
+        if m.get("text", "") != row["text"]:
+            self.event(cid, ts, "edit", edited, uid, source=source)
+        return False
+
+    def delete(self, cid, ts, source="live"):
+        row = self.con.execute("SELECT user_id FROM messages WHERE channel_id=? AND ts=? AND deleted=0", (cid, ts)).fetchone()
+        if row is None:
+            return
+        self.con.execute("UPDATE messages SET deleted=1 WHERE channel_id=? AND ts=?", (cid, ts))
+        self.event(cid, ts, "delete", now_iso(), row["user_id"], source=source)
+
+    def thread_seen(self, cid, parent_ts, latest_reply, reply_count):
+        self.con.execute("UPDATE messages SET latest_reply=?, reply_count=? WHERE channel_id=? AND ts=?",
+                         (latest_reply, reply_count, cid, parent_ts))
+
+    def react_add(self, cid, ts, emoji, uid, source="live"):
+        cur = self.con.execute("INSERT OR IGNORE INTO reactions (channel_id, ts, emoji, user_id, at) VALUES (?, ?, ?, ?, ?)",
+                               (cid, ts, emoji, uid, now_iso()))
+        if cur.rowcount:
+            self.event(cid, ts, "react", now_iso(), uid, emoji, source)
+
+    def react_remove(self, cid, ts, emoji, uid, source="live"):
+        cur = self.con.execute("DELETE FROM reactions WHERE channel_id=? AND ts=? AND emoji=? AND user_id=?", (cid, ts, emoji, uid))
+        if cur.rowcount:
+            self.event(cid, ts, "unreact", now_iso(), uid, emoji, source)
+
+    def sync_reactions(self, cid, m):
+        api = {(r["name"], u) for r in m.get("reactions") or [] for u in r.get("users", [])}
+        have = {(r["emoji"], r["user_id"]) for r in self.con.execute(
+            "SELECT emoji, user_id FROM reactions WHERE channel_id=? AND ts=?", (cid, m["ts"]))}
+        for e, u in api - have:
+            self.react_add(cid, m["ts"], e, u, "backfill")
+        for e, u in have - api:
+            self.react_remove(cid, m["ts"], e, u, "backfill")
+
+
+class Listener:
+    def __init__(self, auth, rec, cfg):
+        self.slack = Slack(auth)
+        self.rec = rec
+        self.cfg = cfg
+        self.ready = False
+        self.pong = 0.0
+        self.tasks = set()
+        self.seen = {}
+        self.media_slots = asyncio.Semaphore(MEDIA_PARALLEL)
+        self.media_busy = set()
+        self.asked_users = set()
+        self.next_id = 1
+
+    async def call(self, method, **params):
+        out = await asyncio.to_thread(self.slack.call, method, **params)
+        await asyncio.sleep(0.3)
+        return out
+
+    async def pages(self, method, key, **params):
+        return await asyncio.to_thread(lambda: list(self.slack.pages(method, key, **params)))
+
+    def spawn(self, coro):
+        t = asyncio.create_task(coro)
+        self.tasks.add(t)
+        t.add_done_callback(self.tasks.discard)
+
+    async def load_users(self):
+        for u in await self.pages("users.list", "members", limit=200):
+            p = u.get("profile") or {}
+            self.rec.user(u["id"], p.get("display_name") or p.get("real_name") or u.get("name"))
+
+    async def load_conversations(self):
+        rec = self.rec
+        only = set(self.cfg.get("channels") or [])
+        convs = await self.pages("users.conversations", "channels", types=CONV_TYPES, exclude_archived="true", limit=200)
+        watch = set()
+        for c in convs:
+            if only and c["id"] not in only:
+                continue
+            if c.get("is_im"):
+                name, kind = "dm-" + rec.names.get(c.get("user"), c.get("user") or "?"), "im"
+            else:
+                name, kind = c.get("name") or c["id"], "mpim" if c.get("is_mpim") else ("private" if c.get("is_private") else "public")
+            rec.channel(c["id"], name, kind)
+            watch.add(c["id"])
+        rec.watch = watch
+        return watch
+
+    async def ask_user(self, uid):
+        if not uid or uid in self.rec.names or uid in self.asked_users:
+            return
+        self.asked_users.add(uid)
+        try:
+            if uid.startswith("B"):
+                b = (await self.call("bots.info", bot=uid)).get("bot") or {}
+                self.rec.user(uid, b.get("name"))
+            else:
+                u = (await self.call("users.info", user=uid)).get("user") or {}
+                p = u.get("profile") or {}
+                self.rec.user(uid, p.get("display_name") or p.get("real_name") or u.get("name"))
+        except Exception as e:
+            log(f"user {uid}: {type(e).__name__}: {e}")
+
+    async def backfill(self):
+        try:
+            await self.load_users()
+            watch = await self.load_conversations()
+            for cid in sorted(watch):
+                try:
+                    n = await self.backfill_channel(cid)
+                    if n:
+                        log(f"backfill {cid}: {n} messages checked")
+                except AuthError:
+                    raise
+                except Exception as e:
+                    log(f"backfill {cid} failed: {type(e).__name__}: {e}")
+            self.rec.meta(backfill_at=now_iso())
+            log(f"backfill done; recording {len(watch)} conversations")
+            await self.backfill_media()
+        except AuthError as e:
+            log(f"backfill: the session was refused ({e})")
+
+    async def backfill_channel(self, cid):
+        con = self.rec.con
+        last = con.execute("SELECT max(ts) FROM messages WHERE channel_id=? AND thread_ts IS NULL", (cid,)).fetchone()[0]
+        oldest = f"{time.time() - BACKFILL_DAYS * 86400:.6f}"
+        if last and last < oldest:
+            oldest = last
+        msgs, cursor = [], None
+        for _ in range(10):
+            out = await self.call("conversations.history", channel=cid, oldest=oldest if last else None, limit=200, cursor=cursor)
+            msgs += out.get("messages", [])
+            cursor = (out.get("response_metadata") or {}).get("next_cursor")
+            if not cursor or not last:
+                break
+        msgs.sort(key=lambda m: m["ts"])
+        for m in msgs:
+            old = con.execute("SELECT latest_reply FROM messages WHERE channel_id=? AND ts=?", (cid, m["ts"])).fetchone()
+            self.rec.message(cid, m, "backfill")
+            self.rec.sync_reactions(cid, m)
+            if m.get("reply_count") and (old is None or old["latest_reply"] != m.get("latest_reply")):
+                await self.backfill_thread(cid, m["ts"])
+        return len(msgs)
+
+    async def backfill_thread(self, cid, ts):
+        for r in await self.pages("conversations.replies", "messages", channel=cid, ts=ts, limit=200):
+            if r["ts"] != ts:
+                self.rec.message(cid, r, "backfill")
+                self.rec.sync_reactions(cid, r)
+
+    async def backfill_media(self):
+        got = failed = 0
+        for r in self.rec.con.execute("SELECT channel_id, ts FROM messages WHERE files LIKE '%\"url\"%' AND deleted=0").fetchall():
+            g, f = await self.fetch_media(r["channel_id"], r["ts"])
+            got, failed = got + g, failed + f
+        if got or failed:
+            log(f"media backfill: {got} files downloaded, {failed} could not be downloaded")
+
+    async def fetch_media(self, cid, ts):
+        row = self.rec.con.execute("SELECT files FROM messages WHERE channel_id=? AND ts=?", (cid, ts)).fetchone()
+        if row is None or not row["files"]:
+            return 0, 0
+        got = failed = 0
+        for f in json.loads(row["files"]):
+            if not f.get("url"):
+                continue
+            dest = file_path(cid, ts, f)
+            if dest.exists() or dest in self.media_busy:
+                continue
+            self.media_busy.add(dest)
+            try:
+                async with self.media_slots:
+                    size = await asyncio.to_thread(self.slack.download, f["url"], dest)
+                got += 1
+                log(f"media saved {cid}/{ts}/{dest.name} ({size} bytes)")
+            except Exception as e:
+                failed += 1
+                log(f"media {cid}/{ts}/{dest.name} failed: {type(e).__name__}: {e}")
+            finally:
+                self.media_busy.discard(dest)
+        return got, failed
+
+    def on_message(self, d):
+        rec, cid, sub = self.rec, d.get("channel"), d.get("subtype")
+        if sub == "message_changed":
+            m = d.get("message") or {}
+            if rec.message(cid, m) is False and m.get("reply_count"):
+                rec.thread_seen(cid, m["ts"], m.get("latest_reply"), m.get("reply_count"))
+            self.spawn(self.fetch_media(cid, m.get("ts")))
+        elif sub == "message_deleted":
+            rec.delete(cid, d.get("deleted_ts"))
+        elif sub == "message_replied":
+            m = d.get("message") or {}
+            rec.thread_seen(cid, m.get("ts"), m.get("latest_reply"), m.get("reply_count"))
+        else:
+            rec.message(cid, d)
+            self.spawn(self.ask_user(d.get("user") or d.get("bot_id")))
+            if d.get("files"):
+                self.spawn(self.fetch_media(cid, d["ts"]))
+
+    def dispatch(self, d):
+        t = d.get("type")
+        self.seen[t] = self.seen.get(t, 0) + 1
+        rec = self.rec
+        if t == "pong":
+            self.pong = time.time()
+            rec.meta(pong_at=now_iso(), rtm_events=json.dumps(self.seen, sort_keys=True))
+        elif t == "hello":
+            self.ready = True
+            self.pong = time.time()
+            rec.meta(state="ready", ready_at=now_iso(), pong_at=now_iso(), rtm_events=json.dumps(self.seen))
+            log("connected")
+            self.spawn(self.backfill())
+        elif t == "message" and rec.watched(d.get("channel")):
+            self.on_message(d)
+        elif t in ("reaction_added", "reaction_removed"):
+            item = d.get("item") or {}
+            if item.get("type") == "message" and rec.watched(item.get("channel")):
+                fn = rec.react_add if t == "reaction_added" else rec.react_remove
+                fn(item["channel"], item["ts"], d.get("reaction"), d.get("user"))
+        elif t in ("channel_joined", "group_joined", "im_created", "mpim_joined", "channel_left", "group_left", "channel_rename", "group_rename"):
+            self.spawn(self.load_conversations())
+        elif t == "user_change":
+            u = d.get("user") or {}
+            p = u.get("profile") or {}
+            rec.user(u.get("id"), p.get("display_name") or p.get("real_name") or u.get("name"))
+
+    async def pinger(self, ws):
+        while True:
+            await asyncio.sleep(PING_SECS)
+            if time.time() - self.pong > PING_SECS * 3:
+                log("no pong; reconnecting")
+                await ws.close()
+                return
+            self.next_id += 1
+            await ws.send(json.dumps({"id": self.next_id, "type": "ping"}))
+
+    async def connect_once(self):
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import ConnectionClosed
+
+        self.ready = False
+        info = await self.call("rtm.connect")
+        self.rec.meta(self_id=info["self"]["id"], self_name=info["self"]["name"], team=info["team"]["name"])
+        self.rec.user(info["self"]["id"], self.rec.names.get(info["self"]["id"]) or info["self"]["name"])
+        ping = None
+        async with connect(
+            info["url"], max_size=None, ping_interval=None, open_timeout=20, close_timeout=5,
+            user_agent_header=UA, origin="https://app.slack.com",
+            additional_headers={"Cookie": f"d={self.slack.cookie}"},
+        ) as ws:
+            ping = asyncio.create_task(self.pinger(ws))
+            try:
+                async for raw in ws:
+                    d = json.loads(raw)
+                    if d.get("type") == "goodbye":
+                        log("server said goodbye; reconnecting")
+                        await ws.close()
+                        break
+                    if d.get("type") == "error":
+                        log(f"rtm error: {d.get('error')}")
+                        continue
+                    self.dispatch(d)
+            except ConnectionClosed:
+                pass
+            finally:
+                ping.cancel()
+        return ws.close_code
+
+    async def run(self):
+        failures = 0
+        while True:
+            try:
+                code = await self.connect_once()
+                log(f"connection closed (code {code})")
+            except AuthError:
+                raise
+            except Exception as e:
+                log(f"connection error: {type(e).__name__}: {e}")
+            failures = 0 if self.ready else failures + 1
+            self.rec.meta(state="reconnecting")
+            await asyncio.sleep(min(60, 2 ** failures) + random.random())
+
+
+async def serve(listener):
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, task.cancel)
+    try:
+        await listener.run()
+    except asyncio.CancelledError:
+        for t in list(listener.tasks):
+            t.cancel()
+
+
+def cmd_daemon(args):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another slack-gw daemon is running", file=sys.stderr)
+        return 1
+    if not AUTH.exists():
+        print("no session yet. Run: slack-gw login", file=sys.stderr)
+        return EXIT_AUTH
+    for stale in MEDIA.glob("*/*/.*.part"):
+        stale.unlink(missing_ok=True)
+    con = db_connect()
+    watch = [r["id"] for r in con.execute("SELECT id FROM channels")]
+    rec = Recorder(con, watch)
+    auth = load_auth()
+    rec.meta(state="starting", pid=os.getpid(), started_at=now_iso(), domain=auth["domain"])
+    try:
+        asyncio.run(serve(Listener(auth, rec, load_config())))
+    except AuthError as e:
+        rec.meta(state="auth_failed", auth_failed_at=now_iso())
+        log(f"the session was refused ({e}). Run: slack-gw login")
+        return EXIT_AUTH
+    rec.meta(state="stopped", stopped_at=now_iso())
+    log("stopped")
+    return 0
+
+
+class View:
+    def __init__(self, con):
+        self.con = con
+        self.cfg = load_config()
+        self.users = {r["id"]: r["name"] for r in con.execute("SELECT * FROM users")}
+        self.meta = {r["k"]: r["v"] for r in con.execute("SELECT * FROM meta")}
+        self.self_id = self.meta.get("self_id")
+        self.channel_names = {r["id"]: r["name"] for r in con.execute("SELECT * FROM channels")}
+
+    def name(self, uid):
+        if not uid:
+            return "?"
+        n = self.users.get(uid, uid)
+        return f"{n} (self)" if uid == self.self_id else n
+
+    def alive(self):
+        pong = self.meta.get("pong_at")
+        if not pong or self.meta.get("state") in ("auth_failed", "stopped"):
+            return False
+        pid = self.meta.get("pid") or ""
+        if not pid.isdigit() or int(pid) <= 1:
+            return False
+        try:
+            os.kill(int(pid), 0)
+        except OSError:
+            return False
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(pong)).total_seconds() < ALIVE_SECS
+
+    def channel(self, value, allow_all=False):
+        if allow_all and value == "all":
+            return None
+        if not value:
+            if not self.cfg.get("default_channel"):
+                raise SystemExit(f"no channel given and no default_channel in {CONFIG}; use --channel")
+            return self.cfg["default_channel"]
+        if value in self.channel_names or re.fullmatch(r"[CDG][A-Z0-9]{8,}", value):
+            return value
+        v = value.lstrip("#").lower()
+        exact = [cid for cid, n in self.channel_names.items() if (n or "").lower() == v]
+        hits = exact or [cid for cid, n in self.channel_names.items() if v in (n or "").lower()]
+        if len(hits) != 1:
+            raise SystemExit(f"channel {value!r} matches {len(hits)} recorded conversations; use the id (slack-gw status)")
+        return hits[0]
+
+    def cname(self, cid):
+        n = self.channel_names.get(cid, cid)
+        return n if n.startswith("dm-") else "#" + n
+
+    def when(self, iso):
+        if not iso:
+            return "?"
+        t = datetime.fromisoformat(iso).astimezone()
+        return t.strftime("%H:%M:%S") if t.date() == datetime.now().date() else t.strftime("%m-%d %H:%M")
+
+    def text(self, s):
+        s = re.sub(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>", lambda m: "@" + self.users.get(m.group(1), m.group(1)), s or "")
+        s = re.sub(r"<#([CG][A-Z0-9]+)(?:\|([^>]*))?>", lambda m: "#" + (m.group(2) or self.channel_names.get(m.group(1)) or m.group(1)), s)
+        s = re.sub(r"<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>", lambda m: m.group(1) or "@group", s)
+        s = re.sub(r"<!(here|channel|everyone)(?:\|[^>]*)?>", r"@\1", s)
+        s = re.sub(r"<(https?://[^|>]+)\|([^>]+)>", r"\2 (\1)", s)
+        s = re.sub(r"<(https?://[^>]+)>", r"\1", s)
+        return html.unescape(s)
+
+    def msg(self, cid, ts):
+        return self.con.execute("SELECT * FROM messages WHERE channel_id=? AND ts=?", (cid, ts)).fetchone()
+
+    def preview(self, row, width=70):
+        if row is None:
+            return "(not recorded)"
+        t = " ".join(self.text(row["text"]).split()) or "(no text)"
+        t = t if len(t) <= width else t[: width - 1] + "…"
+        return f'{self.name(row["user_id"])}: "{t}"'
+
+    def reactions(self, cid, ts):
+        out = {}
+        for r in self.con.execute("SELECT emoji, user_id FROM reactions WHERE channel_id=? AND ts=? ORDER BY at", (cid, ts)):
+            out.setdefault(f":{r['emoji']}:", []).append(self.name(r["user_id"]))
+        return out
+
+    def link(self, row):
+        dom = self.meta.get("domain") or "app"
+        base = f"https://{dom}.slack.com/archives/{row['channel_id']}/p{row['ts'].replace('.', '')}"
+        return base + (f"?thread_ts={row['thread_ts']}&cid={row['channel_id']}" if row["thread_ts"] else "")
+
+    def files(self, row):
+        out = json.loads(row["files"]) if row["files"] else []
+        for f in out:
+            if f.get("url"):
+                p = file_path(row["channel_id"], row["ts"], f)
+                f["path"] = str(p) if p.exists() else None
+        return out
+
+    def as_json(self, row):
+        parent = self.msg(row["channel_id"], row["thread_ts"]) if row["thread_ts"] else None
+        return {
+            "channel_id": row["channel_id"], "channel": self.channel_names.get(row["channel_id"]), "ts": row["ts"],
+            "link": self.link(row), "user": self.users.get(row["user_id"]), "user_id": row["user_id"],
+            "self": row["user_id"] == self.self_id, "created_at": ts_iso(row["ts"]), "edited_at": row["edited_at"],
+            "deleted": bool(row["deleted"]), "subtype": row["subtype"], "text": self.text(row["text"]),
+            "thread_ts": row["thread_ts"], "thread_preview": self.preview(parent) if row["thread_ts"] else None,
+            "reply_count": row["reply_count"], "files": self.files(row), "reactions": self.reactions(row["channel_id"], row["ts"]),
+        }
+
+    def block(self, row, indent="", where=False):
+        head = f"{self.when(ts_iso(row['ts']))}  {self.name(row['user_id'])}  [ts {row['ts']}]"
+        if where:
+            head += f"  {self.cname(row['channel_id'])}"
+        if row["deleted"]:
+            head += "  (deleted)"
+        if row["subtype"] and row["subtype"] not in ("bot_message", "thread_broadcast", "file_share", "me_message"):
+            head += f"  ({row['subtype']})"
+        lines = [head]
+        if row["thread_ts"] and not indent:
+            lines.append(f"  ↳ in thread [ts {row['thread_ts']}] {self.preview(self.msg(row['channel_id'], row['thread_ts']))}")
+        for ln in self.text(row["text"]).splitlines() or ([] if row["files"] else ["(no text)"]):
+            lines.append("    " + ln)
+        for f in self.files(row):
+            if f.get("url"):
+                lines.append("  📎 " + " ".join(x for x in (f.get("name"), f.get("path") or "(not downloaded)") if x))
+            elif f.get("link") or f.get("title"):
+                lines.append(f"  🔗 {f.get('title') or ''} {f.get('link') or ''}".rstrip())
+        if row["edited_at"]:
+            lines.append(f"  ✎ edited {self.when(row['edited_at'])}")
+        reacts = self.reactions(row["channel_id"], row["ts"])
+        if reacts:
+            lines.append("  reactions: " + " · ".join(f"{e} {', '.join(who)}" for e, who in reacts.items()))
+        if row["reply_count"] and not row["thread_ts"]:
+            lines.append(f"  💬 {row['reply_count']} replies: slack-gw thread {row['ts']} --channel {row['channel_id']}")
+        return "\n".join(indent + ln for ln in lines)
+
+    def max_seq(self, cid):
+        q = "SELECT COALESCE(max(seq), 0) FROM events" + (" WHERE channel_id=?" if cid else "")
+        return self.con.execute(q, (cid,) if cid else ()).fetchone()[0]
+
+
+def warn_if_down(view):
+    if not view.alive():
+        print(f"warning: the listener is not running (state: {view.meta.get('state', 'never started')}); "
+              "the data can be old. Run: slack-gw status", file=sys.stderr)
+
+
+def ensure_alive(con, wait_secs=60):
+    if View(con).alive():
+        return True
+    if View(con).meta.get("state") == "auth_failed":
+        print("the listener stopped: Slack refused the session. Run: slack-gw login", file=sys.stderr)
+        return False
+    subprocess.run(["systemctl", "--user", "start", SERVICE], check=False)
+    deadline = time.time() + wait_secs
+    while time.time() < deadline:
+        time.sleep(2)
+        if View(con).alive():
+            return True
+    print("the listener did not start. Check: journalctl --user -u slack-gw -n 50", file=sys.stderr)
+    return False
+
+
+def cmd_status(args):
+    con = db_connect()
+    v = View(con)
+    m = v.meta
+    pong = m.get("pong_at")
+    age = f"{int((datetime.now(timezone.utc) - datetime.fromisoformat(pong)).total_seconds())}s ago" if pong else "never"
+    print(f"listener: {'running' if v.alive() else 'DOWN'} (state {m.get('state', 'never started')}, last pong {age})")
+    if m.get("self_name"):
+        print(f"account: {m['self_name']} in {m.get('team')} · connected {v.when(m.get('ready_at'))} · backfill {v.when(m.get('backfill_at'))}")
+        seen = json.loads(m.get("rtm_events") or "{}")
+        if seen:
+            print(f"websocket events since connect: {sum(seen.values())} ({', '.join(f'{k} {n}' for k, n in sorted(seen.items(), key=lambda kv: -kv[1])[:8])})")
+    send = set(v.cfg.get("send_channels") or [])
+    print("conversations (✉ = send allowed, * = default):")
+    for cid, name in sorted(v.channel_names.items(), key=lambda kv: kv[1]):
+        n, last = con.execute("SELECT count(*), max(ts) FROM messages WHERE channel_id=? AND deleted=0", (cid,)).fetchone()
+        tail = f", last {v.preview(v.msg(cid, last), 50)} at {v.when(ts_iso(last))}" if last else ""
+        mark = ("✉" if cid in send else " ") + ("*" if cid == v.cfg["default_channel"] else " ")
+        print(f"  {mark} {cid}  {v.cname(cid)}: {n} messages, cursor {v.max_seq(cid)}{tail}")
+    print(f"media: {MEDIA}/<channel id>/<ts>/ · config: {CONFIG}")
+    print(f"service: systemctl --user status {SERVICE} · logs: journalctl --user -u slack-gw -n 50")
+    return 0 if v.alive() else 1
+
+
+def cmd_read(args):
+    con = db_connect()
+    v = View(con)
+    warn_if_down(v)
+    cid = v.channel(args.channel)
+    top = "AND thread_ts IS NULL"
+    if args.since:
+        rows = con.execute(f"SELECT * FROM messages WHERE channel_id=? AND ts>=? {top} ORDER BY ts", (cid, args.since)).fetchall()
+    elif args.around:
+        before = con.execute(f"SELECT * FROM messages WHERE channel_id=? AND ts<? {top} ORDER BY ts DESC LIMIT ?", (cid, args.around, args.last)).fetchall()
+        after = con.execute(f"SELECT * FROM messages WHERE channel_id=? AND ts>=? {top} ORDER BY ts LIMIT ?", (cid, args.around, args.last + 1)).fetchall()
+        rows = list(reversed(before)) + list(after)
+    else:
+        rows = list(reversed(con.execute(f"SELECT * FROM messages WHERE channel_id=? {top} ORDER BY ts DESC LIMIT ?", (cid, args.last)).fetchall()))
+    if args.json:
+        for r in rows:
+            print(json.dumps(v.as_json(r), ensure_ascii=False))
+        print(json.dumps({"cursor": v.max_seq(cid)}))
+        return 0
+    print(f"{v.cname(cid)}: {len(rows)} messages (thread replies: slack-gw thread TS)\n")
+    for r in rows:
+        print(v.block(r))
+    print(f"\ncursor {v.max_seq(cid)} · wait for more: slack-gw wait --channel {cid} --cursor {v.max_seq(cid)}")
+    return 0
+
+
+def cursor_for_ts(con, cid, ts):
+    where = "channel_id=? AND " if cid else ""
+    p = (cid,) if cid else ()
+    seq = con.execute(f"SELECT min(seq) FROM events WHERE {where}ts=? AND kind='message'", (*p, ts)).fetchone()[0]
+    if seq is not None:
+        return seq
+    later = con.execute(f"SELECT min(seq) FROM events WHERE {where}kind='message' AND ts>?", (*p, ts)).fetchone()[0]
+    if later is not None:
+        return later - 1
+    return con.execute(f"SELECT COALESCE(max(seq), 0) FROM events {'WHERE channel_id=?' if cid else ''}", p).fetchone()[0]
+
+
+def event_line(v, e, where):
+    target = v.msg(e["channel_id"], e["ts"])
+    at, who, kind = v.when(e["at"]), v.name(e["user_id"]), e["kind"]
+    loc = f"  {v.cname(e['channel_id'])}" if where else ""
+    if kind == "message" and target is not None:
+        return v.block(target, where=where)
+    if kind in ("react", "unreact"):
+        verb = "reacted" if kind == "react" else "removed reaction"
+        return f"{at}  {who}  {verb} :{e['emoji']}: on [ts {e['ts']}] {v.preview(target)}{loc}"
+    if kind == "edit" and target is not None:
+        body = "\n".join("    " + ln for ln in v.text(target["text"]).splitlines())
+        return f"{at}  {who}  edited [ts {e['ts']}]{loc}\n{body}"
+    if kind == "delete":
+        return f"{at}  deleted [ts {e['ts']}] {v.preview(target)}{loc}"
+    return f"{at}  {who}  {kind} [ts {e['ts']}]{loc}"
+
+
+def event_json(v, e):
+    target = v.msg(e["channel_id"], e["ts"])
+    return {
+        "seq": e["seq"], "kind": e["kind"], "at": e["at"], "channel_id": e["channel_id"],
+        "user": v.users.get(e["user_id"]), "user_id": e["user_id"], "self": e["user_id"] == v.self_id,
+        "emoji": e["emoji"], "source": e["source"],
+        "message": v.as_json(target) if target is not None else {"channel_id": e["channel_id"], "ts": e["ts"]},
+    }
+
+
+def pending(con, cid, cursor, others, self_id):
+    if cid:
+        rows = con.execute("SELECT * FROM events WHERE channel_id=? AND seq>? ORDER BY seq", (cid, cursor)).fetchall()
+    else:
+        rows = con.execute("SELECT * FROM events WHERE seq>? ORDER BY seq", (cursor,)).fetchall()
+    top = rows[-1]["seq"] if rows else cursor
+    if others:
+        rows = [r for r in rows if r["user_id"] != self_id]
+    return rows, top
+
+
+def cmd_wait(args):
+    con = db_connect()
+    v = View(con)
+    cid = v.channel(args.channel, allow_all=True)
+    label = v.cname(cid) if cid else "all conversations"
+    chan_arg = cid or "all"
+    if args.cursor is not None:
+        cursor = args.cursor
+    elif args.since:
+        cursor = cursor_for_ts(con, cid, args.since)
+    else:
+        cursor = v.max_seq(cid)
+    if not ensure_alive(con):
+        return EXIT_AUTH if View(con).meta.get("state") == "auth_failed" else EXIT_DOWN
+    deadline = time.time() + args.timeout
+    next_check = time.time() + 30
+    while True:
+        rows, top = pending(con, cid, cursor, args.others, v.self_id)
+        if rows:
+            time.sleep(min(args.batch, max(0, deadline - time.time())))
+            break
+        cursor = top
+        if time.time() >= deadline:
+            if args.json:
+                print(json.dumps({"events": [], "cursor": cursor, "timeout": True}))
+            else:
+                print(f"no new events in {label} for {args.timeout / 60:g} min. cursor {cursor}")
+                print(f"next: slack-gw wait --channel {chan_arg} --cursor {cursor}{' --others' if args.others else ''}")
+            return EXIT_TIMEOUT
+        if time.time() >= next_check:
+            next_check = time.time() + 30
+            if not View(con).alive() and not ensure_alive(con):
+                return EXIT_DOWN
+        time.sleep(1)
+    v = View(con)
+    rows, top = pending(con, cid, cursor, args.others, v.self_id)
+    if args.json:
+        print(json.dumps({"events": [event_json(v, e) for e in rows], "cursor": top}, ensure_ascii=False))
+        return 0
+    print(f"{len(rows)} new events in {label} (cursor {top}):\n")
+    for e in rows:
+        print(event_line(v, e, where=cid is None))
+    print(f"\nnext: slack-gw wait --channel {chan_arg} --cursor {top}{' --others' if args.others else ''}")
+    return 0
+
+
+def cmd_thread(args):
+    con = db_connect()
+    v = View(con)
+    warn_if_down(v)
+    cid = v.channel(args.channel)
+    root = v.msg(cid, args.ts)
+    if root is not None and root["thread_ts"]:
+        root = v.msg(cid, root["thread_ts"]) or root
+    if root is None:
+        print(f"message {args.ts} is not recorded in {v.cname(cid)}. Try: slack-gw read --channel {cid} --around {args.ts}", file=sys.stderr)
+        return 1
+    print(v.block(root))
+    rows = con.execute("SELECT * FROM messages WHERE channel_id=? AND thread_ts=? ORDER BY ts", (cid, root["ts"])).fetchall()
+    for r in rows:
+        print(v.block(r, "    "))
+    print(f"\n{len(rows)} replies. Reply: slack-gw reply {root['ts']} --channel {cid} \"text\"")
+    return 0
+
+
+def cmd_media(args):
+    con = db_connect()
+    v = View(con)
+    cid = v.channel(args.channel)
+    row = v.msg(cid, args.ts)
+    if row is None:
+        print(f"message {args.ts} is not recorded in {v.cname(cid)}", file=sys.stderr)
+        return 1
+    files = [f for f in v.files(row) if f.get("url")]
+    if not files:
+        print(f"message {args.ts} has no files", file=sys.stderr)
+        return 1
+    for f in files:
+        if f["path"]:
+            print(f["path"])
+        else:
+            print(f"not downloaded: {f['name']} (logs: journalctl --user -u slack-gw | grep media)", file=sys.stderr)
+    return 0 if all(f["path"] for f in files) else 1
+
+
+def cmd_send(args):
+    text = sys.stdin.read() if args.text == "-" else args.text
+    text = text.strip("\n")
+    if not text and not args.file:
+        print("nothing to send: give a text or --file", file=sys.stderr)
+        return 2
+    for p in args.file or []:
+        if not Path(p).is_file():
+            print(f"no such file: {p}", file=sys.stderr)
+            return 2
+    con = db_connect()
+    v = View(con)
+    cid = v.channel(args.channel)
+    allowed = v.cfg.get("send_channels") or []
+    if cid not in allowed:
+        print(f"refused: {v.cname(cid)} ({cid}) is not in send_channels of {CONFIG} (allowed: {', '.join(allowed) or 'none'})", file=sys.stderr)
+        return 2
+    try:
+        slack = Slack(load_auth())
+        if args.file:
+            files = [slack.upload(p) for p in args.file]
+            slack.call("files.completeUploadExternal", files=files, channel_id=cid, thread_ts=args.thread,
+                       initial_comment=text or None)
+            ts = None
+            print(f"posted {len(files)} file(s){' with the text' if text else ''} to {v.cname(cid)}{' in thread ' + args.thread if args.thread else ''}")
+        else:
+            out = slack.call("chat.postMessage", channel=cid, text=text, thread_ts=args.thread,
+                             reply_broadcast="true" if args.broadcast and args.thread else None, unfurl_links="false")
+            ts = out["ts"]
+            link = slack.call("chat.getPermalink", channel=cid, message_ts=ts).get("permalink")
+            print(f"posted to {v.cname(cid)}: ts {ts}\n{link}")
+    except AuthError as e:
+        print(f"Slack refused the session ({e}). Run: slack-gw login", file=sys.stderr)
+        return EXIT_AUTH
+    except SlackError as e:
+        print(f"send failed: {e}", file=sys.stderr)
+        return 1
+    since = args.thread or ts
+    if since:
+        print(f"wait for answers: slack-gw wait --channel {cid} --since {since} --others")
+    return 0
+
+
+LOGIN_SCRIPT = r"""
+import json, time
+TEAM = TEAM_ID
+tid = new_tab("https://app.slack.com/client/" + TEAM)
+found = None
+try:
+    wait_for_load()
+    deadline = time.time() + 40
+    while time.time() < deadline and not found:
+        time.sleep(1.5)
+        t = js("(()=>{try{const c=JSON.parse(localStorage.localConfig_v2).teams[%r];return c?{token:c.token,domain:c.domain,name:c.name}:null}catch(e){return null}})()" % TEAM)
+        if t and t.get("token"):
+            found = t
+    cookies = cdp("Network.getCookies", urls=["https://app.slack.com", "https://slack.com"])["cookies"]
+    d = next((c["value"] for c in cookies if c["name"] == "d"), None)
+finally:
+    close_tab(tid)
+if not found or not d:
+    print("LOGIN-FAILED: no Slack session for this team in the browser. Is Slack logged in in this browser?")
+else:
+    print("LOGIN-DATA " + json.dumps({"token": found["token"], "domain": found["domain"], "team_name": found["name"], "d": d}))
+"""
+
+
+def cmd_login(args):
+    cfg = load_config()
+    if not cfg.get("team_id"):
+        print(f"no team_id in {CONFIG}. Copy config.example.json there and set your Slack team id (T...)", file=sys.stderr)
+        return 2
+    env = dict(os.environ, BU_NAME="sgw-login", BH_TAB_MARKER="0")
+    script = LOGIN_SCRIPT.replace("TEAM_ID", repr(cfg["team_id"]), 1)
+    out = subprocess.run(["browser-harness"], input=script, text=True, capture_output=True, env=env, cwd=HOME)
+    subprocess.run(["browser-harness", "--reload"], env=env, cwd=HOME, capture_output=True)
+    line = next((ln for ln in out.stdout.splitlines() if ln.startswith("LOGIN-DATA ")), None)
+    if not line:
+        print("login failed:", (out.stdout + out.stderr).strip()[-800:], file=sys.stderr)
+        return 1
+    data = json.loads(line[len("LOGIN-DATA "):])
+    data["team_id"] = cfg["team_id"]
+    data["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        who = Slack(data).call("auth.test")
+    except (AuthError, SlackError) as e:
+        print(f"login failed: Slack refused the session from the browser ({e})", file=sys.stderr)
+        return 1
+    write_private(AUTH, data)
+    if not CONFIG.exists():
+        write_private(CONFIG, DEFAULT_CONFIG)
+    con = db_connect()
+    Recorder(con, []).meta(state="restarting", domain=data["domain"])
+    subprocess.run(["systemctl", "--user", "restart", SERVICE], check=False)
+    print(f"signed in as {who.get('user')} in {who.get('team')}; saved the session in {AUTH} (mode 600) and restarted {SERVICE}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="slack-gw", description=USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("daemon")
+    sub.add_parser("status")
+    sub.add_parser("login")
+    r = sub.add_parser("read")
+    r.add_argument("--channel")
+    g = r.add_mutually_exclusive_group()
+    g.add_argument("--since", type=parse_ts, help="this message and every message after it")
+    g.add_argument("--around", type=parse_ts, help="--last messages before and after this message")
+    r.add_argument("--last", type=int, default=25)
+    r.add_argument("--json", action="store_true")
+    w = sub.add_parser("wait")
+    w.add_argument("--channel", help="a channel, or all")
+    g = w.add_mutually_exclusive_group()
+    g.add_argument("--since", type=parse_ts, help="events after this message (your question)")
+    g.add_argument("--cursor", type=int, help="events after this cursor (from the last read or wait)")
+    w.add_argument("--timeout", type=parse_duration, default=parse_duration("60m"))
+    w.add_argument("--batch", type=parse_duration, default=parse_duration("30s"), help="after the first event, wait this long for more")
+    w.add_argument("--others", action="store_true", help="skip the events of the account itself")
+    w.add_argument("--json", action="store_true")
+    t = sub.add_parser("thread")
+    t.add_argument("ts", type=parse_ts)
+    t.add_argument("--channel")
+    md = sub.add_parser("media")
+    md.add_argument("ts", type=parse_ts)
+    md.add_argument("--channel")
+    s = sub.add_parser("send")
+    s.add_argument("text")
+    s.add_argument("--channel")
+    s.add_argument("--thread", type=parse_ts)
+    s.add_argument("--broadcast", action="store_true", help="a thread reply that also shows in the channel")
+    s.add_argument("--file", action="append")
+    rp = sub.add_parser("reply")
+    rp.add_argument("thread", type=parse_ts)
+    rp.add_argument("text")
+    rp.add_argument("--channel")
+    rp.add_argument("--broadcast", action="store_true")
+    rp.add_argument("--file", action="append")
+    args = ap.parse_args()
+    handlers = {
+        "daemon": cmd_daemon, "status": cmd_status, "login": cmd_login, "read": cmd_read, "wait": cmd_wait,
+        "thread": cmd_thread, "media": cmd_media, "send": cmd_send, "reply": cmd_send,
+    }
+    sys.exit(handlers[args.cmd](args))
+
+
+if __name__ == "__main__":
+    main()

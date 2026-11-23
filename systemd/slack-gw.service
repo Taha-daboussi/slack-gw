@@ -1,0 +1,14 @@
+[Unit]
+Description=Slack websocket listener and sender for the agents (slack-gw)
+
+[Service]
+ExecStart=%h/.local/bin/slack-gw daemon
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
