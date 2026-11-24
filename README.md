@@ -75,6 +75,16 @@ slack-gw login                                    # new session when Slack logs 
 
 `--channel` takes an id or a part of the name. `wait` exits 0 with new events, 5 at the timeout, 4 when the listener is down and 3 when Slack refused the session (run `slack-gw login`). Each output ends with the next `wait --cursor N` command, so a loop never misses an event.
 
+### Mentions
+
+`read` shows a tag as `@name`, so you can write it the same way. Before a post, `send` and `reply` turn each `@name` into a real Slack tag, so the people get a notification:
+
+- `@name` of exactly one recorded person becomes `<@U...>`.
+- `@handle` of a Slack user group (for example `@dev-team`) becomes `<!subteam^S...>`. `send` reads the group list from Slack (`usergroups.list`) only when the text has an `@`.
+- `@here`, `@channel` and `@everyone` become `<!here>`, `<!channel>` and `<!everyone>`. These notify the whole channel.
+
+The match ignores case. Text in backticks, email addresses and unknown names stay as they are. A name that more than one person or group has stays plain text, and `send` prints `not tagged, more than one person or group has this name: ...`. `send` prints `tagged: ...` for the names it tagged.
+
 ### Typing
 
 Before a text post, `send` and `reply` show "is typing" in the channel, or in the thread for a reply, like the web client does. The time fits the text: about 5 characters a second, ±20%, from 2 s to 12 s. `--typing 8s` sets the time (max 60 s), and `--no-typing` or `--typing 0` turns it off.
