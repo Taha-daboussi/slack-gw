@@ -15,6 +15,7 @@ Slack's web client logs in with a session token (`xoxc-...`) plus the `d` cookie
 | Live events | `rtm.connect` gives a `wss://` URL. One websocket, a `ping` every 30 s. |
 | Read | `conversations.history`, `conversations.replies`, `users.list`, `users.conversations` |
 | Send / reply | `chat.postMessage` (thread reply: `thread_ts`) |
+| "is typing" | `{"type":"user_typing","channel":C,"thread_ts":TS}` on the daemon websocket, every 3 s |
 | Files | `files.getUploadURLExternal`, upload, `files.completeUploadExternal` |
 | Downloads | `url_private` with the token and the cookie |
 
@@ -53,7 +54,7 @@ Needs `uv` (the script runs with `uv run --script`), `browser-harness` for `logi
 | `send_channels` | the only channels that `send` and `reply` can post to. Empty = no sends. |
 | `channels` | record only these conversations. Empty = every conversation you are a member of. |
 
-Local files, never in git: `~/.config/slack-gw/auth.json` (the session, mode 600), `~/.local/state/slack-gw/slack.db` and `media/`.
+Local files, never in git: `~/.config/slack-gw/auth.json` (the session, mode 600), `~/.local/state/slack-gw/slack.db`, `media/` and `typing.sock`.
 
 ## Commands
 
@@ -65,12 +66,20 @@ slack-gw wait --channel all --others              # block until someone else wri
 slack-gw wait --channel dev --since TS --others   # answers after your message TS
 slack-gw reply TS "text"                          # reply in the thread of TS, not in the channel
 slack-gw send "text" --file before.png --file after.png
+slack-gw reply TS "text" --typing 8s              # show "is typing" for 8 s first
+slack-gw reply TS "text" --no-typing              # post at once
 echo "text" | slack-gw send -                     # text from stdin
 slack-gw media TS                                 # local paths of the files of a message
 slack-gw login                                    # new session when Slack logs you out
 ```
 
 `--channel` takes an id or a part of the name. `wait` exits 0 with new events, 5 at the timeout, 4 when the listener is down and 3 when Slack refused the session (run `slack-gw login`). Each output ends with the next `wait --cursor N` command, so a loop never misses an event.
+
+### Typing
+
+Before a text post, `send` and `reply` show "is typing" in the channel, or in the thread for a reply, like the web client does. The time fits the text: about 5 characters a second, ±20%, from 2 s to 12 s. `--typing 8s` sets the time (max 60 s), and `--no-typing` or `--typing 0` turns it off.
+
+The daemon sends the frames on its open websocket, so there is no second connection. `send` asks it over the local socket `~/.local/state/slack-gw/typing.sock` (mode 600), and the daemon sends a frame every 3 s until `send` posts or exits. When the listener is down, `send` prints `typing skipped: ...` and posts at once.
 
 ## Agent flow: watch, draft, reply in the thread
 

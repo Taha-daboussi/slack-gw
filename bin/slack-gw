@@ -14,6 +14,7 @@ import random
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -32,6 +33,7 @@ CONFIG = CONF_DIR / "config.json"
 DB = STATE_DIR / "slack.db"
 LOCK = STATE_DIR / "daemon.lock"
 MEDIA = STATE_DIR / "media"
+TYPING_SOCK = STATE_DIR / "typing.sock"
 SERVICE = "slack-gw.service"
 DEFAULT_CONFIG = {
     "team_id": None,
@@ -48,6 +50,11 @@ ALIVE_SECS = 150
 PING_SECS = 30
 BACKFILL_DAYS = 7
 MEDIA_PARALLEL = 3
+TYPING_CPS = 5
+TYPING_MIN = 2
+TYPING_MAX = 12
+TYPING_EVERY = 3
+TYPING_CAP = 60
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
 
 USAGE = """\
@@ -60,14 +67,15 @@ channels in send_channels of the config (default: none).
   slack-gw read   [--channel C] [--last N | --since TS | --around TS] [--json]
   slack-gw wait   [--channel C|all] [--cursor N | --since TS] [--timeout 60m] [--batch 30s] [--others] [--json]
   slack-gw thread TS [--channel C]                  a message and every reply in its thread
-  slack-gw send   TEXT|- [--channel C] [--thread TS] [--broadcast] [--file PATH ...]
-  slack-gw reply  TS TEXT|- [--channel C] [--broadcast] [--file PATH ...]
+  slack-gw send   TEXT|- [--channel C] [--thread TS] [--broadcast] [--file PATH ...] [--typing 5s | --no-typing]
+  slack-gw reply  TS TEXT|- [--channel C] [--broadcast] [--file PATH ...] [--typing 5s | --no-typing]
   slack-gw media  TS [--channel C]                  the local files of one message
   slack-gw login                                    take a fresh session from the logged-in browser
   slack-gw daemon                                   the listener itself (systemd runs it)
 
 C is a channel id or a part of its name; the default is default_channel of the config.
 TS is a Slack message ts (for example 1700000000.123456).
+send and reply show "is typing" for a time that fits the text length (2-12 s) before they post.
 wait exits 0 with new events, 5 at the timeout, 4 when the listener is down, 3 when the session is refused.
 """
 
@@ -361,6 +369,7 @@ class Listener:
         self.media_busy = set()
         self.asked_users = set()
         self.next_id = 1
+        self.ws = None
 
     async def call(self, method, **params):
         out = await asyncio.to_thread(self.slack.call, method, **params)
@@ -546,6 +555,34 @@ class Listener:
             self.next_id += 1
             await ws.send(json.dumps({"id": self.next_id, "type": "ping"}))
 
+    async def on_typing(self, reader, writer):
+        try:
+            req = json.loads(await reader.readline() or b"{}")
+            cid = req.get("channel")
+            if cid not in (load_config().get("send_channels") or []):
+                writer.write(f"refused: {cid} is not in send_channels\n".encode())
+            elif not (self.ready and self.ws):
+                writer.write(b"refused: the websocket is not connected\n")
+            else:
+                writer.write(b"ok\n")
+                frame = {"type": "user_typing", "channel": cid}
+                if req.get("thread_ts"):
+                    frame["thread_ts"] = req["thread_ts"]
+                deadline = time.time() + TYPING_CAP
+                while time.time() < deadline and self.ready and self.ws:
+                    self.next_id += 1
+                    await self.ws.send(json.dumps({**frame, "id": self.next_id}))
+                    try:
+                        if not await asyncio.wait_for(reader.read(1), TYPING_EVERY):
+                            break
+                    except asyncio.TimeoutError:
+                        pass
+            await writer.drain()
+        except Exception as e:
+            log(f"typing: {type(e).__name__}: {e}")
+        finally:
+            writer.close()
+
     async def connect_once(self):
         from websockets.asyncio.client import connect
         from websockets.exceptions import ConnectionClosed
@@ -561,6 +598,7 @@ class Listener:
             additional_headers={"Cookie": f"d={self.slack.cookie}"},
         ) as ws:
             ping = asyncio.create_task(self.pinger(ws))
+            self.ws = ws
             try:
                 async for raw in ws:
                     d = json.loads(raw)
@@ -575,6 +613,7 @@ class Listener:
             except ConnectionClosed:
                 pass
             finally:
+                self.ws = None
                 ping.cancel()
         return ws.close_code
 
@@ -598,6 +637,12 @@ async def serve(listener):
     task = asyncio.current_task()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, task.cancel)
+    TYPING_SOCK.unlink(missing_ok=True)
+    old = os.umask(0o177)
+    try:
+        await asyncio.start_unix_server(listener.on_typing, path=str(TYPING_SOCK))
+    finally:
+        os.umask(old)
     try:
         await listener.run()
     except asyncio.CancelledError:
@@ -976,6 +1021,29 @@ def cmd_media(args):
     return 0 if all(f["path"] for f in files) else 1
 
 
+def typing_secs(text):
+    return min(TYPING_MAX, max(TYPING_MIN, len(text) / TYPING_CPS * random.uniform(0.8, 1.2)))
+
+
+def start_typing(cid, thread_ts, secs):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(5)
+        sock.connect(str(TYPING_SOCK))
+        sock.sendall((json.dumps({"channel": cid, "thread_ts": thread_ts}) + "\n").encode())
+        answer = sock.makefile().readline().strip()
+    except OSError as e:
+        sock.close()
+        print(f"typing skipped: no answer from the listener ({e}). Check: slack-gw status", file=sys.stderr)
+        return None
+    if answer != "ok":
+        sock.close()
+        print(f"typing skipped: {answer or 'the listener closed the connection'}", file=sys.stderr)
+        return None
+    time.sleep(secs)
+    return sock
+
+
 def cmd_send(args):
     text = sys.stdin.read() if args.text == "-" else args.text
     text = text.strip("\n")
@@ -993,6 +1061,9 @@ def cmd_send(args):
     if cid not in allowed:
         print(f"refused: {v.cname(cid)} ({cid}) is not in send_channels of {CONFIG} (allowed: {', '.join(allowed) or 'none'})", file=sys.stderr)
         return 2
+    typing = None
+    if text and not args.no_typing and args.typing != 0:
+        typing = start_typing(cid, args.thread, typing_secs(text) if args.typing is None else min(args.typing, TYPING_CAP))
     try:
         slack = Slack(load_auth())
         if args.file:
@@ -1013,6 +1084,9 @@ def cmd_send(args):
     except SlackError as e:
         print(f"send failed: {e}", file=sys.stderr)
         return 1
+    finally:
+        if typing:
+            typing.close()
     since = args.thread or ts
     if since:
         print(f"wait for answers: slack-gw wait --channel {cid} --since {since} --others")
@@ -1114,6 +1188,9 @@ def main():
     rp.add_argument("--channel")
     rp.add_argument("--broadcast", action="store_true")
     rp.add_argument("--file", action="append")
+    for sp in (s, rp):
+        sp.add_argument("--typing", type=parse_duration, help="show \"is typing\" for this time before the post (default: from the text length)")
+        sp.add_argument("--no-typing", action="store_true", help="post at once, with no \"is typing\"")
     args = ap.parse_args()
     handlers = {
         "daemon": cmd_daemon, "status": cmd_status, "login": cmd_login, "read": cmd_read, "wait": cmd_wait,
