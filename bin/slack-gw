@@ -76,6 +76,7 @@ channels in send_channels of the config (default: none).
 C is a channel id or a part of its name; the default is default_channel of the config.
 TS is a Slack message ts (for example 1700000000.123456).
 send and reply show "is typing" for a time that fits the text length (2-12 s) before they post.
+send and reply turn @name (one recorded person), @group handles, @here, @channel and @everyone into real tags.
 wait exits 0 with new events, 5 at the timeout, 4 when the listener is down, 3 when the session is refused.
 """
 
@@ -1021,6 +1022,47 @@ def cmd_media(args):
     return 0 if all(f["path"] for f in files) else 1
 
 
+MENTION_WORD = re.compile(r"(?<![\w<@])@[\w.-]")
+SPECIAL_MENTIONS = {"here": "<!here>", "channel": "<!channel>", "everyone": "<!everyone>"}
+
+
+def user_groups(slack, text):
+    if not MENTION_WORD.search(text or ""):
+        return []
+    try:
+        out = slack.call("usergroups.list")
+    except SlackError as e:
+        print(f"group tags skipped: Slack did not give the group list ({e})", file=sys.stderr)
+        return []
+    return [(g["id"], g["handle"]) for g in out.get("usergroups") or [] if g.get("handle")]
+
+
+def tag_mentions(text, users, groups=()):
+    tags_by_name = {}
+    for uid, name in users.items():
+        if name and uid[:1] in "UW":
+            tags_by_name.setdefault(name.lower(), set()).add(f"<@{uid}>")
+    for gid, handle in groups:
+        tags_by_name.setdefault(handle.lower(), set()).add(f"<!subteam^{gid}>")
+    for word, tag in SPECIAL_MENTIONS.items():
+        tags_by_name[word] = {tag}
+    names = sorted(tags_by_name, key=len, reverse=True)
+    pattern = re.compile(r"(?<![\w<@])@(" + "|".join(map(re.escape, names)) + r")(?![\w-])", re.IGNORECASE)
+    tagged, unclear = [], []
+
+    def swap(m):
+        tags = tags_by_name[m.group(1).lower()]
+        if len(tags) != 1:
+            unclear.append(m.group(0))
+            return m.group(0)
+        tagged.append(m.group(0))
+        return next(iter(tags))
+
+    parts = re.split(r"(```.*?```|`[^`\n]*`)", text, flags=re.DOTALL)
+    out = "".join(p if i % 2 else pattern.sub(swap, p) for i, p in enumerate(parts))
+    return out, tagged, unclear
+
+
 def typing_secs(text):
     return min(TYPING_MAX, max(TYPING_MIN, len(text) / TYPING_CPS * random.uniform(0.8, 1.2)))
 
@@ -1062,10 +1104,15 @@ def cmd_send(args):
         print(f"refused: {v.cname(cid)} ({cid}) is not in send_channels of {CONFIG} (allowed: {', '.join(allowed) or 'none'})", file=sys.stderr)
         return 2
     typing = None
-    if text and not args.no_typing and args.typing != 0:
-        typing = start_typing(cid, args.thread, typing_secs(text) if args.typing is None else min(args.typing, TYPING_CAP))
     try:
         slack = Slack(load_auth())
+        text, tagged, unclear = tag_mentions(text, v.users, user_groups(slack, text))
+        if tagged:
+            print(f"tagged: {', '.join(tagged)}")
+        if unclear:
+            print(f"not tagged, more than one person or group has this name: {', '.join(unclear)}", file=sys.stderr)
+        if text and not args.no_typing and args.typing != 0:
+            typing = start_typing(cid, args.thread, typing_secs(text) if args.typing is None else min(args.typing, TYPING_CAP))
         if args.file:
             files = [slack.upload(p) for p in args.file]
             slack.call("files.completeUploadExternal", files=files, channel_id=cid, thread_ts=args.thread,
