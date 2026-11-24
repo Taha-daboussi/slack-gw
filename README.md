@@ -60,7 +60,7 @@ Local files, never in git: `~/.config/slack-gw/auth.json` (the session, mode 600
 ```sh
 slack-gw status                                   # listener state, every conversation, cursors
 slack-gw read --channel dev --last 20             # top-level messages (threads: see thread)
-slack-gw thread 1795424604.468059                 # a message and all its replies
+slack-gw thread 1700000000.123456                 # a message and all its replies
 slack-gw wait --channel all --others              # block until someone else writes anywhere
 slack-gw wait --channel dev --since TS --others   # answers after your message TS
 slack-gw reply TS "text"                          # reply in the thread of TS, not in the channel

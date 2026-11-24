@@ -67,7 +67,7 @@ channels in send_channels of the config (default: none).
   slack-gw daemon                                   the listener itself (systemd runs it)
 
 C is a channel id or a part of its name; the default is default_channel of the config.
-TS is a Slack message ts (for example 1795281453.235269).
+TS is a Slack message ts (for example 1700000000.123456).
 wait exits 0 with new events, 5 at the timeout, 4 when the listener is down, 3 when the session is refused.
 """
 
@@ -101,7 +101,7 @@ def parse_duration(text):
 
 def parse_ts(text):
     if not re.fullmatch(r"\d{9,11}\.\d{6}", text):
-        raise argparse.ArgumentTypeError(f"bad ts {text!r}; use a Slack ts like 1795281453.235269")
+        raise argparse.ArgumentTypeError(f"bad ts {text!r}; use a Slack ts like 1700000000.123456")
     return text
 
 
