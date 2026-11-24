@@ -1,0 +1,6 @@
+auth.json
+config.json
+*.db
+*.db-wal
+*.db-shm
+media/
